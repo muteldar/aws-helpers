@@ -1,0 +1,106 @@
+require 'bundler/setup'
+require 'aws-sdk-ec2'
+
+def get_regions
+    region_list = []
+    ec2Client = Aws::EC2::Client.new()
+    r = ec2Client.describe_regions
+    r.regions.each { |region|
+        region_list << region.region_name
+    }
+    return region_list
+end
+
+def list_default_vpcs(regions)
+    vpc = Struct.new(:region, :vpc_id, :cidr_block)
+    default_vpcs, threads = [], []
+    regions.each { |location|
+        threads << Thread.new do
+            ec2Client = Aws::EC2::Client.new(region: location)
+            vpcs = ec2Client.describe_vpcs
+            next if vpcs.vpcs[0] === nil
+            if vpcs.vpcs[0].is_default
+                default_vpcs << vpc.new(location, vpcs.vpcs[0].vpc_id, vpcs.vpcs[0].cidr_block)
+            end
+        end
+    }
+    threads.map{|thread| thread.join}
+    return default_vpcs
+end
+
+def detatch_gateways(default_vpcs)
+    threads = []
+    default_vpcs.each {|vpc|
+        threads << Thread.new do
+            ec2Client = Aws::EC2::Client.new(region: vpc.region)
+            internet_gateways = ec2Client.describe_internet_gateways({
+                filters: [
+                    {
+                        name: "attachment.vpc-id",
+                        values: [vpc.vpc_id],
+                    },
+                ]
+            })
+            internet_gateways.each{ |gateway|
+                if !gateway.internet_gateways[0].nil?
+                    ec2Client.detach_internet_gateway({
+                        internet_gateway_id: gateway.internet_gateways[0].internet_gateway_id,
+                        vpc_id: vpc.vpc_id
+                    })
+                    ec2Client.delete_internet_gateway({
+                        internet_gateway_id: gateway.internet_gateways[0].internet_gateway_id
+                    })
+                end
+            }
+        end
+    }
+    threads.map{|thread| thread.join}
+end
+
+def delete_subnets(default_vpcs)
+    subnets_to_delete, threads = [], []
+    default_vpcs.each {|vpc|
+        threads << Thread.new do
+            ec2Client = Aws::EC2::Client.new(region: vpc.region)
+            subnets = ec2Client.describe_subnets({
+                filters: [
+                    {
+                        name: "vpc-id", 
+                        values: [vpc.vpc_id], 
+                      }, 
+                ]
+            })
+            if !subnets.empty?
+                subnets.subnets.each{|subnet|  
+                    ec2Client.delete_subnet({
+                        subnet_id: subnet.subnet_id 
+                    })
+                }
+            end
+        end
+    }
+    threads.map{|thread| thread.join}
+end
+
+def delete_default_vpcs(default_vpcs)
+    detatch_gateways(default_vpcs)
+    delete_subnets(default_vpcs)
+    default_vpcs.each {|vpc|
+        puts "Deleting Default VPC #{vpc.vpc_id} in #{vpc.region} with cidr #{vpc.cidr_block}"
+        ec2Client = Aws::EC2::Client.new(region: vpc.region)
+        ec2Client.delete_vpc({
+            vpc_id: vpc.vpc_id
+        })
+    }
+end
+
+desc 'vpc-helper: Remove All Default VPCs'
+task :remove_defaults do
+    regions = get_regions
+    default_vpcs = list_default_vpcs(regions)
+    if !default_vpcs.empty?
+        delete_default_vpcs(default_vpcs)
+    else
+        puts "No default VPCs found"
+    end
+end
