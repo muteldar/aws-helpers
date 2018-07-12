@@ -95,7 +95,7 @@ def delete_default_vpcs(default_vpcs)
 end
 
 desc 'vpc-helper: Remove All Default VPCs'
-task :remove_defaults do
+task :remove_default_vpcs do
     regions = get_regions
     default_vpcs = list_default_vpcs(regions)
     if !default_vpcs.empty?
